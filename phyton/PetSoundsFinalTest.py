@@ -19,13 +19,13 @@ CORS(app)  # Allow Unity to connect
 audio_queue = queue.Queue()
 SAMPLE_RATE = 16000
 CHANNELS = 1
-BUFFER_DURATION = 3  # seconds
+BUFFER_DURATION = 5  # seconds
 
-# Unity가 폴링해서 가져갈 최신 상태
 latest_response = {
     "emotion": "neutral",
     "phonemes": "",
     "translation": "",
+    "user_text": "",          # 👤 Whisper가 들은 사람 말
     "has_new_response": False
 }
 response_lock = threading.Lock()
@@ -33,9 +33,9 @@ response_lock = threading.Lock()
 # ------------------------
 # SILENCE DETECTION
 # ------------------------
-silence_threshold = 0.01        # 평균 볼륨이 이 값보다 작으면 무음으로 판단
-silence_duration_needed = 2.0   # 이 초 이상 무음이면 "아무도 없어요?" 메시지 전송
-silence_time = 0.0              # 누적 무음 시간
+silence_threshold = 0.01        # 이 값보다 작으면 거의 무음
+silence_duration_needed = 2.0   # 이 초 이상 무음이면 "Hello? Nobody there?"
+silence_time = 0.0
 
 
 # ------------------------
@@ -114,57 +114,58 @@ def pet_word(emotion="neutral", complexity=2):
 
 
 # ------------------------
-# GPT RESPONSE GENERATOR
+# PET RESPONSE GENERATOR (thank you 완전 차단)
 # ------------------------
 def generate_pet_response(user_text: str):
-    """
-    사람이 실제로 말을 했을 때만 호출되는 함수.
-    - 아주 짧은 말(<4글자)은 강제 neutral
-    - 'thank you' 류 표현은 프롬프트 & post-process에서 제거
-    """
-
     text_clean = user_text.strip()
+
+    # 너무 짧은 말은 그냥 neutral로
     if not text_clean or len(text_clean) < 4:
-        # 너무 짧으면 그냥 살짝 주변 둘러보는 느낌
-        return "neutral", 1, "(looks around quietly)"
+        return "neutral", 1, "(soft idle blink)"
+
+    # thank you 계열 금지 패턴
+    banned_patterns = [
+        "thank you",
+        "thanks",
+        "thank u",
+        "thankyou",
+        "thank-you",
+        "you’re welcome",
+        "you're welcome",
+        "thank you for watching",
+        "thanks for watching",
+        "thank u for watching"
+    ]
+
+    lowered = text_clean.lower()
+    if any(p in lowered for p in banned_patterns):
+        # 유저가 직접 thank you 말하면, 펫은 조용히 중립 반응만
+        return "neutral", 1, "(the pet quietly acknowledges you)"
 
     try:
         client = openai.OpenAI()
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
                     "content": """
-You are a digital pet that responds ONLY based on the emotional tone of the human's message.
+You are a digital pet with its own sound language.
 
-Rules you MUST follow:
-
-1. NEVER say “thank you”, “thanks”, “thank u”, “you’re welcome”, or anything similar.
-2. NEVER generate polite human-like responses. You are a pet, not a human.
-3. The translation must be cute, simple, and emotional, but NOT repetitive.
-4. Do NOT default to “happy” all the time. Use emotions realistically:
-   - positive → happy
-   - negative / sad content → sad
-   - angry / rude content → angry
-   - questions / curiosity → curious
-   - calm / short / low-energy speech → neutral
-   - very energetic / excited speech → excited
-   - fear / anxiety → scared
-5. The translation must match the emotion and should vary across responses.
-6. Avoid using the same wording too often.
-
-Format strictly:
-emotion,complexity,"translation text"
-
-Examples:
-neutral,1,"(soft blink)"
-curious,2,"Hmm? What's happening?"
-sad,1,"I feel a little droopy..."
-angry,2,"Hey! That startled me!"
-happy,2,"Yip-yip! I like this!"
-excited,3,"Whoa—so much energy!"
-scared,2,"Eep… that was spooky..."
+Hard rules:
+- NEVER say “thank you”, “thanks”, “thank u”, “thankyou”, “you’re welcome”, or any similar phrase.
+- NEVER say “thank you for watching” or “thanks for watching”.
+- If such phrases are about to appear, replace them with a simple, wordless emotional reaction.
+- Use emotions realistically:
+  • positive → happy
+  • sad content → sad
+  • rude / harsh content → angry
+  • questions / curiosity → curious
+  • calm / low-energy / neutral statements → neutral
+  • very energetic → excited
+  • fear / anxiety → scared
+- The translation should be short, cute, and emotional, NOT polite human speech.
+- Format strictly: emotion,complexity,"translation text"
 """
                 },
                 {"role": "user", "content": text_clean}
@@ -174,21 +175,23 @@ scared,2,"Eep… that was spooky..."
         )
 
         result = response.choices[0].message.content.strip()
-        parts = result.split(',', 2)
+        parts = result.split(",", 2)
 
         emotion = parts[0].strip().lower() if len(parts) > 0 else "neutral"
-        complexity = int(parts[1].strip()) if len(parts) > 1 else 2
+        try:
+            complexity = int(parts[1].strip()) if len(parts) > 1 else 2
+        except ValueError:
+            complexity = 2
         translation = parts[2].strip() if len(parts) > 2 else "\"...\""
 
-        # 안전장치: emotion이 리스트에 없으면 neutral
+        # GPT 결과에서도 thank you 계열 완전 필터링
+        low_trans = translation.lower()
+        if any(p in low_trans for p in banned_patterns):
+            translation = "\"(soft digital chirp)\""
+
         if emotion not in EMOTIONS:
             emotion = "neutral"
         complexity = max(1, min(4, complexity))
-
-        # 추가 안전장치: translation에서 thank you 류 표현 강제 제거
-        low = translation.lower()
-        if "thank" in low or "welcome" in low:
-            translation = "\"(wiggles quietly instead of saying thanks)\""
 
         return emotion, complexity, translation
 
@@ -201,10 +204,6 @@ scared,2,"Eep… that was spooky..."
 # AUDIO CALLBACK + WORKER
 # ------------------------
 def audio_callback(indata, frames, time_info, status):
-    """
-    마이크에서 들어오는 오디오를 큐에 넣고,
-    일정 시간 이상 완전 조용하면 'Hello, Nobody there?' 메시지 전송
-    """
     global silence_time
 
     if status:
@@ -212,34 +211,28 @@ def audio_callback(indata, frames, time_info, status):
 
     volume = np.abs(indata).mean()
 
-    # 무음 누적
     if volume < silence_threshold:
         silence_time += frames / SAMPLE_RATE
     else:
         silence_time = 0.0
 
-    # 🔇 완전 조용한 상태가 일정 시간 지속되면 → neutral + 'Is anyone there?'
+    # 완전 조용한 상태 유지 → Hello? Nobody there?
     if silence_time >= silence_duration_needed:
-        print("🔇 Silence detected → sending 'Hello, Nobody there?' neutral response")
+        print("🔇 Silence detected → sending 'Hello? Nobody there?'")
 
         with response_lock:
             latest_response["emotion"] = "neutral"
             latest_response["phonemes"] = ""
-            latest_response["translation"] = "Hello, Nobody there?"
+            latest_response["translation"] = "Hello? Nobody there?"
+            latest_response["user_text"] = ""        # 사람 말은 없음
             latest_response["has_new_response"] = True
-            # audio_data / sample_rate 는 굳이 안 넣어도 됨
 
         silence_time = 0.0
 
-    # 음성 분석용 버퍼에 추가
     audio_queue.put(indata.copy())
 
 
 def transcription_worker():
-    """
-    큐에 쌓인 오디오를 3초 단위로 모아서 Whisper로 텍스트 변환
-    → GPT로 emotion / translation 생성 → Unity에 전달
-    """
     client = openai.OpenAI()
     buffer = []
     frames_needed = int(SAMPLE_RATE * BUFFER_DURATION)
@@ -276,7 +269,7 @@ def transcription_worker():
 
                     text = transcript.text.strip()
 
-                    if text and len(text) > 0:
+                    if text:
                         print(f"\n{'=' * 60}")
                         print(f"👤 YOU: {text}")
 
@@ -294,9 +287,9 @@ def transcription_worker():
                             latest_response["translation"] = translation
                             latest_response["audio_data"] = sound
                             latest_response["sample_rate"] = sr
+                            latest_response["user_text"] = text   # 👤 사람 말 저장
                             latest_response["has_new_response"] = True
 
-                        # 로컬에서도 사운드 재생
                         sd.play(sound, sr)
 
                 except Exception as e:
@@ -319,28 +312,25 @@ def status():
 
 @app.route('/get_response', methods=['GET'])
 def get_response():
-    """
-    Unity가 poll해서 emotion / translation 가져가는 엔드포인트
-    """
+    """Unity polls this to get the latest pet response"""
     with response_lock:
         if latest_response["has_new_response"]:
-            resp = {
+            response_data = {
                 "emotion": latest_response["emotion"],
                 "phonemes": latest_response["phonemes"],
                 "translation": latest_response["translation"],
+                "user_text": latest_response["user_text"],   # 👤 Unity로 보내기
                 "has_response": True
             }
-            latest_response["has_new_response"] = False
-            return jsonify(resp)
+            latest_response["has_new_response"] = False  # Mark as read
+            return jsonify(response_data)
         else:
             return jsonify({"has_response": False})
 
 
 @app.route('/get_audio', methods=['GET'])
 def get_audio():
-    """
-    Unity가 펫 소리 WAV를 받고 싶을 때 사용하는 엔드포인트
-    """
+    """Unity can fetch the audio file"""
     with response_lock:
         if "audio_data" in latest_response:
             audio = latest_response["audio_data"]
@@ -367,15 +357,9 @@ def main():
     print("🐾 UNITY-CONNECTED DIGITAL PET SERVER 🐾")
     print("=" * 60)
     print("\nHow it works:")
-    print("• Python listens to your voice continuously")
-    print("• Pet generates responses (emotion + translation + sounds)")
-    print("• Unity polls the server to display the responses")
-    print("\nAPI Endpoints for Unity:")
-    print("• GET http://localhost:5000/status")
-    print("• GET http://localhost:5000/get_response")
-    print("• GET http://localhost:5000/get_audio")
-    print("=" * 60)
-    print()
+    print("• Listens to your voice")
+    print("• Generates emotion + phonemes + translation")
+    print("• Unity polls /get_response for updates\n")
 
     if not os.environ.get("OPENAI_API_KEY"):
         print("⚠️  OPENAI_API_KEY not found")
@@ -384,11 +368,9 @@ def main():
             os.environ["OPENAI_API_KEY"] = key_input
             print("✅ API key set!\n")
 
-    # 음성 → 텍스트 쓰레드
-    thread = threading.Thread(target=transcription_worker, daemon=True)
-    thread.start()
+    t = threading.Thread(target=transcription_worker, daemon=True)
+    t.start()
 
-    # 마이크 스트림 쓰레드
     def start_audio_stream():
         try:
             with sd.InputStream(
@@ -406,7 +388,6 @@ def main():
     audio_thread = threading.Thread(target=start_audio_stream, daemon=True)
     audio_thread.start()
 
-    # Flask 서버 시작
     print("🚀 Starting Flask server...\n")
     app.run(host='0.0.0.0', port=5000, debug=False)
 
