@@ -1,4 +1,4 @@
-# F25 — Emotion-Reactive Screen Pet
+# Emotion-Reactive Digital Pet
 
 An interactive **AI companion ("pet")** that watches your face through the webcam and reacts in real time.
 Facial-emotion recognition runs in Python (DeepFace) and streams the detected emotion to a Unity
